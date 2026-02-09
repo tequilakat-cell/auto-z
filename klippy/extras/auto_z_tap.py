@@ -7,8 +7,17 @@
 
 import logging
 import math
+import collections
 from . import manual_probe
 from . import probe as probe_module
+
+
+try:
+    ProbeResult = manual_probe.ProbeResult
+except AttributeError:
+    # Compatibility with older Klipper trees that don't export ProbeResult.
+    ProbeResult = collections.namedtuple('probe_result', [
+        'bed_x', 'bed_y', 'bed_z', 'test_x', 'test_y', 'test_z'])
 
 
 # ---------------------------------------------------------------------------
@@ -991,7 +1000,7 @@ class AutoZTap:
     # ------------------------------------------------------------------
 
     def _normalize_probe_result(self, raw_result):
-        """Convert various probe result formats into manual_probe.ProbeResult.
+        """Convert various probe result formats into ProbeResult.
 
         Some third-party probe modules return float/tuple/dict instead of the
         native Klipper ProbeResult namedtuple. Normalize here so commands don't
@@ -1011,7 +1020,7 @@ class AutoZTap:
                 test_x = float(getattr(raw_result, 'test_x', bed_x))
                 test_y = float(getattr(raw_result, 'test_y', bed_y))
                 test_z = float(getattr(raw_result, 'test_z', default_z))
-                return manual_probe.ProbeResult(
+                return ProbeResult(
                     bed_x, bed_y, bed_z, test_x, test_y, test_z)
 
             # Dict-like results
@@ -1029,7 +1038,7 @@ class AutoZTap:
                 test_x = float(raw_result.get('test_x', bed_x))
                 test_y = float(raw_result.get('test_y', bed_y))
                 test_z = float(raw_result.get('test_z', default_z))
-                return manual_probe.ProbeResult(
+                return ProbeResult(
                     bed_x, bed_y, bed_z, test_x, test_y, test_z)
 
             # Tuple/list results
@@ -1045,12 +1054,12 @@ class AutoZTap:
                 else:
                     raise self.printer.command_error(
                         "AUTO_Z_TAP: empty probe result tuple/list")
-                return manual_probe.ProbeResult(
+                return ProbeResult(
                     bed_x, bed_y, bed_z, bed_x, bed_y, default_z)
 
             # Scalar result (commonly just z)
             bed_z = float(raw_result)
-            return manual_probe.ProbeResult(
+            return ProbeResult(
                 default_x, default_y, bed_z, default_x, default_y, default_z)
         except self.printer.command_error:
             raise
