@@ -90,8 +90,10 @@ class ProbePreset:
             'thermal_soak_sensors': 'heater_bed',
             'max_drift': 1.0,
             'max_total_adjustment': 0.600,
-            'safe_offset_min': -0.600,
-            'safe_offset_max': 0.600,
+            # Microprobe/Klicky style setups commonly have larger nozzle/probe
+            # deltas than fixed probes.
+            'safe_offset_min': -3.000,
+            'safe_offset_max': 3.000,
         },
         'bltouch': {
             'description': 'BLTouch / servo deploy probe',
@@ -848,8 +850,13 @@ class AutoZTap:
         save_obj = self.printer.lookup_object('save_variables', None)
         if save_obj is None:
             return False
+        literal = repr(value)
+        # Extended gcode parsing uses shlex and strips outer quotes, so keep
+        # the full Python literal in one VALUE token by wrapping in double
+        # quotes and escaping internal backslashes/double-quotes.
+        encoded = literal.replace('\\', '\\\\').replace('"', '\\"')
         self.gcode.run_script_from_command(
-            'SAVE_VARIABLE VARIABLE=%s VALUE=%s' % (key, repr(value)))
+            'SAVE_VARIABLE VARIABLE=%s VALUE=\"%s\"' % (key, encoded))
         return True
 
     def _load_persistent_state(self):
