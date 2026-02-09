@@ -982,6 +982,75 @@ class AutoZTap:
     # Probing
     # ------------------------------------------------------------------
 
+    def _normalize_probe_result(self, raw_result):
+        """Convert various probe result formats into manual_probe.ProbeResult.
+
+        Some third-party probe modules return float/tuple/dict instead of the
+        native Klipper ProbeResult namedtuple. Normalize here so commands don't
+        crash with attribute errors.
+        """
+        try:
+            cur = self.toolhead.get_position()
+            default_x = float(cur[0])
+            default_y = float(cur[1])
+            default_z = float(cur[2])
+
+            # Native Klipper probe result or compatible object
+            if hasattr(raw_result, 'bed_z'):
+                bed_x = float(getattr(raw_result, 'bed_x', default_x))
+                bed_y = float(getattr(raw_result, 'bed_y', default_y))
+                bed_z = float(getattr(raw_result, 'bed_z'))
+                test_x = float(getattr(raw_result, 'test_x', bed_x))
+                test_y = float(getattr(raw_result, 'test_y', bed_y))
+                test_z = float(getattr(raw_result, 'test_z', default_z))
+                return manual_probe.ProbeResult(
+                    bed_x, bed_y, bed_z, test_x, test_y, test_z)
+
+            # Dict-like results
+            if isinstance(raw_result, dict):
+                bed_z = raw_result.get('bed_z', raw_result.get('z'))
+                if bed_z is None:
+                    raise self.printer.command_error(
+                        "AUTO_Z_TAP: probe result dictionary is missing "
+                        "'bed_z'/'z': %r" % (raw_result,))
+                bed_x = float(raw_result.get(
+                    'bed_x', raw_result.get('x', default_x)))
+                bed_y = float(raw_result.get(
+                    'bed_y', raw_result.get('y', default_y)))
+                bed_z = float(bed_z)
+                test_x = float(raw_result.get('test_x', bed_x))
+                test_y = float(raw_result.get('test_y', bed_y))
+                test_z = float(raw_result.get('test_z', default_z))
+                return manual_probe.ProbeResult(
+                    bed_x, bed_y, bed_z, test_x, test_y, test_z)
+
+            # Tuple/list results
+            if isinstance(raw_result, (tuple, list)):
+                if len(raw_result) >= 3:
+                    bed_x = float(raw_result[0])
+                    bed_y = float(raw_result[1])
+                    bed_z = float(raw_result[2])
+                elif len(raw_result) == 1:
+                    bed_x = default_x
+                    bed_y = default_y
+                    bed_z = float(raw_result[0])
+                else:
+                    raise self.printer.command_error(
+                        "AUTO_Z_TAP: empty probe result tuple/list")
+                return manual_probe.ProbeResult(
+                    bed_x, bed_y, bed_z, bed_x, bed_y, default_z)
+
+            # Scalar result (commonly just z)
+            bed_z = float(raw_result)
+            return manual_probe.ProbeResult(
+                default_x, default_y, bed_z, default_x, default_y, default_z)
+        except self.printer.command_error:
+            raise
+        except Exception as e:
+            raise self.printer.command_error(
+                "AUTO_Z_TAP: unsupported probe result type '%s' (%r): %s"
+                % (type(raw_result).__name__, raw_result, str(e)))
+
     def _probe_once(self, gcmd):
         params = {'SAMPLES': '1'}
         probe_speed = self._effective_probe_speed(gcmd)
@@ -995,7 +1064,8 @@ class AutoZTap:
         probe_gcmd = self.gcode.create_gcode_command(
             'AUTO_Z_TAP_INTERNAL_PROBE',
             'AUTO_Z_TAP_INTERNAL_PROBE', params)
-        return probe_module.run_single_probe(self.probe, probe_gcmd)
+        raw_result = probe_module.run_single_probe(self.probe, probe_gcmd)
+        return self._normalize_probe_result(raw_result)
 
     def _run_warmup_taps(self, gcmd, x, y, count):
         """Execute throwaway probe taps to settle the probe mechanism."""
