@@ -5,6 +5,7 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 
+import logging
 import math
 from . import manual_probe
 from . import probe as probe_module
@@ -777,6 +778,13 @@ class AutoZTap:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _raise_internal_command_error(self, gcmd, context, exc):
+        logging.exception("AUTO_Z_TAP internal error during %s", context)
+        raise gcmd.error(
+            "AUTO_Z_TAP internal error during %s: %s\n"
+            "Check klippy.log traceback for details."
+            % (context, str(exc)))
 
     def _var_key(self, suffix):
         return '%s_%s' % (self.variable_prefix, suffix)
@@ -1632,77 +1640,92 @@ class AutoZTap:
         return result
 
     def _start_calibration(self, gcmd):
-        self._require_probe(gcmd)
-        self._require_save_variables(gcmd)
+        stage = "precheck"
+        try:
+            self._require_probe(gcmd)
+            self._require_save_variables(gcmd)
 
-        if self.pending_calibration is not None:
-            raise gcmd.error(
-                "AUTO_Z_TAP calibration already in progress.\n"
-                "Use ABORT to cancel, or ACCEPT to finish the current "
-                "calibration.")
+            if self.pending_calibration is not None:
+                raise gcmd.error(
+                    "AUTO_Z_TAP calibration already in progress.\n"
+                    "Use ABORT to cancel, or ACCEPT to finish the current "
+                    "calibration.")
 
-        manual_probe.verify_no_manual_probe(self.printer)
+            stage = "manual-probe-check"
+            manual_probe.verify_no_manual_probe(self.printer)
 
-        # Thermal soak before calibration
-        self._maybe_thermal_soak(gcmd)
+            # Thermal soak before calibration
+            stage = "thermal-soak"
+            self._maybe_thermal_soak(gcmd)
 
-        self._ensure_homed(gcmd)
-        self._maybe_clear_bed_mesh()
-        x, y = self._resolve_reference_xy(gcmd)
+            stage = "homing"
+            self._ensure_homed(gcmd)
+            self._maybe_clear_bed_mesh()
+            x, y = self._resolve_reference_xy(gcmd)
 
-        # Warmup taps
-        warmup = gcmd.get_int('WARMUP_TAPS', self.warmup_taps, minval=0)
-        if warmup > 0:
-            self._run_warmup_taps(gcmd, x, y, warmup)
+            # Warmup taps
+            stage = "warmup-taps"
+            warmup = gcmd.get_int('WARMUP_TAPS', self.warmup_taps, minval=0)
+            if warmup > 0:
+                self._run_warmup_taps(gcmd, x, y, warmup)
 
-        # Probe reference point
-        probe_result, probe_spread, retries_used, samples = \
-            self._run_guarded_probe(gcmd, x, y)
+            # Probe reference point
+            stage = "probe-reference"
+            probe_result, probe_spread, retries_used, samples = \
+                self._run_guarded_probe(gcmd, x, y)
 
-        # Z-hop and position for paper test
-        cur = self.toolhead.get_position()
-        hop_target = max(cur[2],
-                         probe_result.bed_z + self.calibration_z_hop,
-                         self.safe_z)
-        self._manual_move(
-            z=hop_target, speed=self._effective_lift_speed(gcmd))
-        self._manual_move(
-            x=probe_result.bed_x, y=probe_result.bed_y,
-            speed=self.travel_speed)
+            # Z-hop and position for paper test
+            stage = "position-for-paper-test"
+            cur = self.toolhead.get_position()
+            hop_target = max(cur[2],
+                             probe_result.bed_z + self.calibration_z_hop,
+                             self.safe_z)
+            self._manual_move(
+                z=hop_target, speed=self._effective_lift_speed(gcmd))
+            self._manual_move(
+                x=probe_result.bed_x, y=probe_result.bed_y,
+                speed=self.travel_speed)
 
-        command_params = dict(gcmd.get_command_parameters())
-        command_params.pop('CALIBRATE', None)
-        command_params.pop('CALIBRATE_IF_NEEDED', None)
+            stage = "store-calibration-context"
+            command_params = dict(gcmd.get_command_parameters())
+            command_params.pop('CALIBRATE', None)
+            command_params.pop('CALIBRATE_IF_NEEDED', None)
 
-        env = self._resolve_environment(gcmd)
-        self.pending_calibration = {
-            'reference_x': x,
-            'reference_y': y,
-            'probe_result': probe_result,
-            'probe_spread': probe_spread,
-            'retries_used': retries_used,
-            'samples': samples,
-            'command_params': command_params,
-            'calibration_bed_temp': env.get('bed_temp'),
-            'calibration_hotend_temp': env.get('hotend_temp'),
-            'calibration_chamber_temp': env.get('chamber_temp'),
-        }
-        self.status['calibration_in_progress'] = True
+            env = self._resolve_environment(gcmd)
+            self.pending_calibration = {
+                'reference_x': x,
+                'reference_y': y,
+                'probe_result': probe_result,
+                'probe_spread': probe_spread,
+                'retries_used': retries_used,
+                'samples': samples,
+                'command_params': command_params,
+                'calibration_bed_temp': env.get('bed_temp'),
+                'calibration_hotend_temp': env.get('hotend_temp'),
+                'calibration_chamber_temp': env.get('chamber_temp'),
+            }
+            self.status['calibration_in_progress'] = True
 
-        self.gcode.respond_info(
-            "AUTO_Z_TAP calibration started at X%.3f Y%.3f "
-            "(probe_type=%s).\n"
-            "Place paper under nozzle and use TESTZ / ACCEPT.\n"
-            "  TESTZ Z=-0.1  (move nozzle down 0.1mm)\n"
-            "  TESTZ Z=+0.1  (move nozzle up 0.1mm)\n"
-            "  TESTZ Z=-     (bisect down)\n"
-            "  TESTZ Z=+     (bisect up)\n"
-            "When paper drag feels right, run ACCEPT.\n"
-            "This calibration only needs to be done once."
-            % (x, y, self.probe_type))
+            stage = "start-manual-probe"
+            self.gcode.respond_info(
+                "AUTO_Z_TAP calibration started at X%.3f Y%.3f "
+                "(probe_type=%s).\n"
+                "Place paper under nozzle and use TESTZ / ACCEPT.\n"
+                "  TESTZ Z=-0.1  (move nozzle down 0.1mm)\n"
+                "  TESTZ Z=+0.1  (move nozzle up 0.1mm)\n"
+                "  TESTZ Z=-     (bisect down)\n"
+                "  TESTZ Z=+     (bisect up)\n"
+                "When paper drag feels right, run ACCEPT.\n"
+                "This calibration only needs to be done once."
+                % (x, y, self.probe_type))
 
-        manual_probe.ManualProbeHelper(
-            self.printer, gcmd, self._finalize_calibration)
+            manual_probe.ManualProbeHelper(
+                self.printer, gcmd, self._finalize_calibration)
+        except self.printer.command_error:
+            raise
+        except Exception as e:
+            self._raise_internal_command_error(
+                gcmd, "AUTO_Z_TAP_CALIBRATE (%s)" % (stage,), e)
 
     def _finalize_calibration(self, mpresult):
         pending = self.pending_calibration
@@ -1783,31 +1806,42 @@ class AutoZTap:
         "paper calibration, then call AUTO_Z_TAP in START_PRINT.")
 
     def cmd_AUTO_Z_TAP(self, gcmd):
-        self._load_persistent_state()
+        try:
+            self._load_persistent_state()
 
-        if gcmd.get_int('CLEAR', 0, minval=0, maxval=1):
-            self.cmd_AUTO_Z_TAP_CLEAR(gcmd)
-            return
+            if gcmd.get_int('CLEAR', 0, minval=0, maxval=1):
+                self.cmd_AUTO_Z_TAP_CLEAR(gcmd)
+                return
 
-        if gcmd.get_int('CALIBRATE', 0, minval=0, maxval=1):
-            self._start_calibration(gcmd)
-            return
+            if gcmd.get_int('CALIBRATE', 0, minval=0, maxval=1):
+                self._start_calibration(gcmd)
+                return
 
-        if (not self.status['calibrated']
-                and gcmd.get_int('CALIBRATE_IF_NEEDED', 0,
-                                 minval=0, maxval=1)):
-            self._start_calibration(gcmd)
-            return
+            if (not self.status['calibrated']
+                    and gcmd.get_int('CALIBRATE_IF_NEEDED', 0,
+                                     minval=0, maxval=1)):
+                self._start_calibration(gcmd)
+                return
 
-        result = self._run_auto_apply(gcmd)
-        gcmd.respond_info(self._summarize(result))
+            result = self._run_auto_apply(gcmd)
+            gcmd.respond_info(self._summarize(result))
+        except self.printer.command_error:
+            raise
+        except Exception as e:
+            self._raise_internal_command_error(gcmd, "AUTO_Z_TAP", e)
 
     cmd_AUTO_Z_TAP_CALIBRATE_help = (
         "Start interactive paper calibration for AUTO_Z_TAP")
 
     def cmd_AUTO_Z_TAP_CALIBRATE(self, gcmd):
-        self._load_persistent_state()
-        self._start_calibration(gcmd)
+        try:
+            self._load_persistent_state()
+            self._start_calibration(gcmd)
+        except self.printer.command_error:
+            raise
+        except Exception as e:
+            self._raise_internal_command_error(
+                gcmd, "AUTO_Z_TAP_CALIBRATE", e)
 
     cmd_AUTO_Z_TAP_STATUS_help = (
         "Show AUTO_Z_TAP calibration, probe type, and health state")
@@ -1939,61 +1973,67 @@ class AutoZTap:
         "Diagnostic probe test without applying offset")
 
     def cmd_AUTO_Z_TAP_PROBE_TEST(self, gcmd):
-        self._require_probe(gcmd)
-        self._ensure_homed(gcmd)
-        self._maybe_clear_bed_mesh()
+        try:
+            self._require_probe(gcmd)
+            self._ensure_homed(gcmd)
+            self._maybe_clear_bed_mesh()
 
-        x, y = self._resolve_reference_xy(gcmd)
-        samples = gcmd.get_int('SAMPLES', self.probe_samples, minval=1)
+            x, y = self._resolve_reference_xy(gcmd)
+            samples = gcmd.get_int('SAMPLES', self.probe_samples, minval=1)
 
-        # Warmup taps
-        warmup = gcmd.get_int('WARMUP_TAPS', self.warmup_taps, minval=0)
-        if warmup > 0:
-            self._run_warmup_taps(gcmd, x, y, warmup)
+            # Warmup taps
+            warmup = gcmd.get_int('WARMUP_TAPS', self.warmup_taps, minval=0)
+            if warmup > 0:
+                self._run_warmup_taps(gcmd, x, y, warmup)
 
-        self._move_to_reference(x, y)
-        z_values = []
-        for idx in range(samples):
-            pres = self._probe_once(gcmd)
-            z_values.append(pres.bed_z)
-            if idx + 1 < samples:
-                cur = self.toolhead.get_position()
-                self._manual_move(
-                    z=cur[2] + self._effective_retract(gcmd),
-                    speed=self._effective_lift_speed(gcmd))
+            self._move_to_reference(x, y)
+            z_values = []
+            for idx in range(samples):
+                pres = self._probe_once(gcmd)
+                z_values.append(pres.bed_z)
+                if idx + 1 < samples:
+                    cur = self.toolhead.get_position()
+                    self._manual_move(
+                        z=cur[2] + self._effective_retract(gcmd),
+                        speed=self._effective_lift_speed(gcmd))
 
-        self._raise_for_travel()
+            self._raise_for_travel()
 
-        sorted_vals = sorted(z_values)
-        avg = sum(z_values) / len(z_values)
-        median = sorted_vals[len(sorted_vals) // 2]
-        spread = max(z_values) - min(z_values)
-        variance = sum((v - avg) ** 2 for v in z_values) / len(z_values)
-        stdev = math.sqrt(variance)
+            sorted_vals = sorted(z_values)
+            avg = sum(z_values) / len(z_values)
+            median = sorted_vals[len(sorted_vals) // 2]
+            spread = max(z_values) - min(z_values)
+            variance = sum((v - avg) ** 2 for v in z_values) / len(z_values)
+            stdev = math.sqrt(variance)
 
-        if spread <= 0.005:
-            rating = "EXCELLENT"
-        elif spread <= 0.015:
-            rating = "GOOD"
-        elif spread <= 0.030:
-            rating = "ACCEPTABLE"
-        else:
-            rating = "POOR"
+            if spread <= 0.005:
+                rating = "EXCELLENT"
+            elif spread <= 0.015:
+                rating = "GOOD"
+            elif spread <= 0.030:
+                rating = "ACCEPTABLE"
+            else:
+                rating = "POOR"
 
-        lines = [
-            "AUTO_Z_TAP probe test (%d samples, probe_type=%s):" % (
-                samples, self.probe_type),
-            "  values: %s" % (
-                ', '.join('%.4f' % v for v in z_values),),
-            "  median=%.6f  average=%.6f" % (median, avg),
-            "  spread=%.4fmm  stdev=%.4fmm" % (spread, stdev),
-            "  rating: %s" % (rating,),
-        ]
+            lines = [
+                "AUTO_Z_TAP probe test (%d samples, probe_type=%s):" % (
+                    samples, self.probe_type),
+                "  values: %s" % (
+                    ', '.join('%.4f' % v for v in z_values),),
+                "  median=%.6f  average=%.6f" % (median, avg),
+                "  spread=%.4fmm  stdev=%.4fmm" % (spread, stdev),
+                "  rating: %s" % (rating,),
+            ]
 
-        if warmup > 0:
-            lines.append("  warmup_taps=%d" % (warmup,))
+            if warmup > 0:
+                lines.append("  warmup_taps=%d" % (warmup,))
 
-        gcmd.respond_info('\n'.join(lines))
+            gcmd.respond_info('\n'.join(lines))
+        except self.printer.command_error:
+            raise
+        except Exception as e:
+            self._raise_internal_command_error(
+                gcmd, "AUTO_Z_TAP_PROBE_TEST", e)
 
     # ------------------------------------------------------------------
     # Moonraker status
