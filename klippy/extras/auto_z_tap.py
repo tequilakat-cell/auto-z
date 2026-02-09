@@ -1747,64 +1747,81 @@ class AutoZTap:
             self.gcode.respond_info("AUTO_Z_TAP calibration aborted")
             return
 
-        probe_z = pending['probe_result'].bed_z
-        paper_z = mpresult.bed_z
-        self.status['calibrated'] = True
-        self.status['reference_probe_z'] = float(probe_z)
-        self.status['paper_delta'] = float(paper_z - probe_z)
-        self.status['reference_x'] = float(pending['reference_x'])
-        self.status['reference_y'] = float(pending['reference_y'])
-        self.status['calibration_bed_temp'] = (
-            pending['calibration_bed_temp'])
-        self.status['calibration_hotend_temp'] = (
-            pending['calibration_hotend_temp'])
-        self.status['calibration_chamber_temp'] = (
-            pending['calibration_chamber_temp'])
-        self.status['calibration_probe_type'] = self.probe_type
+        try:
+            # Older Klipper builds may return non-structured manual probe data.
+            # Normalize both calibration probe and ACCEPT result defensively.
+            probe_result = self._normalize_probe_result(pending['probe_result'])
+            paper_result = self._normalize_probe_result(mpresult)
 
-        self._persist_calibration()
+            probe_z = probe_result.bed_z
+            paper_z = paper_result.bed_z
+            self.status['calibrated'] = True
+            self.status['reference_probe_z'] = float(probe_z)
+            self.status['paper_delta'] = float(paper_z - probe_z)
+            self.status['reference_x'] = float(pending['reference_x'])
+            self.status['reference_y'] = float(pending['reference_y'])
+            self.status['calibration_bed_temp'] = (
+                pending['calibration_bed_temp'])
+            self.status['calibration_hotend_temp'] = (
+                pending['calibration_hotend_temp'])
+            self.status['calibration_chamber_temp'] = (
+                pending['calibration_chamber_temp'])
+            self.status['calibration_probe_type'] = self.probe_type
 
-        # Apply offset using the same probe result
-        apply_gcmd = self.gcode.create_gcode_command(
-            'AUTO_Z_TAP', 'AUTO_Z_TAP', pending['command_params'])
-        result = self._run_auto_apply(
-            apply_gcmd,
-            probe_result=pending['probe_result'],
-            probe_spread=pending['probe_spread'],
-            samples=pending['samples'],
-            retries_used=pending['retries_used'])
+            self._persist_calibration()
 
-        lines = [
-            "AUTO_Z_TAP calibration complete:",
-            "  probe_type=%s" % (self.probe_type,),
-            "  reference_probe_z=%.6f" % (self.status['reference_probe_z'],),
-            "  paper_z=%.6f" % (paper_z,),
-            "  stored_paper_delta=%.6f" % (self.status['paper_delta'],),
-        ]
+            # Apply offset using the same probe result
+            apply_gcmd = self.gcode.create_gcode_command(
+                'AUTO_Z_TAP', 'AUTO_Z_TAP', pending['command_params'])
+            result = self._run_auto_apply(
+                apply_gcmd,
+                probe_result=probe_result,
+                probe_spread=pending['probe_spread'],
+                samples=pending['samples'],
+                retries_used=pending['retries_used'])
 
-        # Optional validation probe
-        if self.calibration_validate:
-            self.gcode.respond_info(
-                "AUTO_Z_TAP: Validating calibration with a fresh probe...")
-            try:
-                x = pending['reference_x']
-                y = pending['reference_y']
-                val_result, val_spread, _, _ = self._run_guarded_probe(
-                    apply_gcmd, x, y)
-                val_drift = val_result.bed_z - probe_z
-                lines.append(
-                    "  validation: drift=%.4fmm spread=%.4fmm" % (
-                        val_drift, val_spread))
-                if abs(val_drift) > self.max_probe_spread * 3:
+            lines = [
+                "AUTO_Z_TAP calibration complete:",
+                "  probe_type=%s" % (self.probe_type,),
+                "  reference_probe_z=%.6f" % (self.status['reference_probe_z'],),
+                "  paper_z=%.6f" % (paper_z,),
+                "  stored_paper_delta=%.6f" % (self.status['paper_delta'],),
+            ]
+
+            # Optional validation probe
+            if self.calibration_validate:
+                self.gcode.respond_info(
+                    "AUTO_Z_TAP: Validating calibration with a fresh probe...")
+                try:
+                    x = pending['reference_x']
+                    y = pending['reference_y']
+                    val_result, val_spread, _, _ = self._run_guarded_probe(
+                        apply_gcmd, x, y)
+                    val_drift = val_result.bed_z - probe_z
                     lines.append(
-                        "  WARNING: Validation shows significant drift. "
-                        "Consider re-running calibration.")
-            except Exception as e:
-                lines.append(
-                    "  validation: FAILED (%s)" % (str(e),))
+                        "  validation: drift=%.4fmm spread=%.4fmm" % (
+                            val_drift, val_spread))
+                    if abs(val_drift) > self.max_probe_spread * 3:
+                        lines.append(
+                            "  WARNING: Validation shows significant drift. "
+                            "Consider re-running calibration.")
+                except Exception as e:
+                    lines.append(
+                        "  validation: FAILED (%s)" % (str(e),))
 
-        lines.append(self._summarize(result))
-        self.gcode.respond_info('\n'.join(lines))
+            lines.append(self._summarize(result))
+            self.gcode.respond_info('\n'.join(lines))
+        except self.printer.command_error as e:
+            logging.exception("AUTO_Z_TAP finalize command error")
+            self.gcode.respond_info(
+                "AUTO_Z_TAP calibration finalize failed: %s\n"
+                "Calibration data may already be saved; run AUTO_Z_TAP_STATUS "
+                "and then AUTO_Z_TAP to apply offset." % (str(e),))
+        except Exception as e:
+            logging.exception("AUTO_Z_TAP finalize internal error")
+            self.gcode.respond_info(
+                "AUTO_Z_TAP internal error during ACCEPT finalize: %s\n"
+                "Check klippy.log traceback for details." % (str(e),))
 
     # ------------------------------------------------------------------
     # Gcode commands
