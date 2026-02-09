@@ -30,12 +30,9 @@ class AdjustmentProfile:
         self.enabled = config.getboolean('enabled', True)
 
         # Match filters (all specified filters must match)
-        self.material = _normalize_token(
-            config.get('material', '', note_valid=False))
-        self.build_surface = _normalize_token(
-            config.get('build_surface', '', note_valid=False))
-        self.nozzle = _normalize_token(
-            config.get('nozzle', '', note_valid=False))
+        self.material = _normalize_token(config.get('material', ''))
+        self.build_surface = _normalize_token(config.get('build_surface', ''))
+        self.nozzle = _normalize_token(config.get('nozzle', ''))
 
         # Static and dynamic modifiers
         self.offset = config.getfloat('offset', 0.)
@@ -45,14 +42,13 @@ class AdjustmentProfile:
         self.first_layer_coeff = config.getfloat('first_layer_coeff', 0.)
 
         # Optional references. If unset, plugin falls back to calibration refs.
-        self.bed_temp_reference = config.getfloat(
-            'bed_temp_reference', None, note_valid=False)
+        self.bed_temp_reference = config.getfloat('bed_temp_reference', None)
         self.hotend_temp_reference = config.getfloat(
-            'hotend_temp_reference', None, note_valid=False)
+            'hotend_temp_reference', None)
         self.chamber_temp_reference = config.getfloat(
-            'chamber_temp_reference', None, note_valid=False)
+            'chamber_temp_reference', None)
         self.first_layer_reference = config.getfloat(
-            'first_layer_reference', None, note_valid=False)
+            'first_layer_reference', None)
 
     def matches(self, material, build_surface, nozzle):
         if self.material and self.material != material:
@@ -155,10 +151,8 @@ class AutoZTap:
         self.safe_z = config.getfloat('safe_z', 10., above=0.)
         self.probe_start_z = config.getfloat('probe_start_z', 8., above=0.)
         self.travel_speed = config.getfloat('travel_speed', 150., above=0.)
-        self.probe_speed = config.getfloat(
-            'probe_speed', None, above=0., note_valid=False)
-        self.lift_speed = config.getfloat(
-            'lift_speed', None, above=0., note_valid=False)
+        self.probe_speed = config.getfloat('probe_speed', None, above=0.)
+        self.lift_speed = config.getfloat('lift_speed', None, above=0.)
         self.sample_retract_dist = config.getfloat(
             'sample_retract_dist', 1.5, above=0.)
 
@@ -179,19 +173,16 @@ class AutoZTap:
         self.chamber_temp_coeff = config.getfloat('chamber_temp_coeff', 0.)
         self.first_layer_coeff = config.getfloat('first_layer_coeff', 0.)
 
-        self.bed_temp_reference = config.getfloat(
-            'bed_temp_reference', None, note_valid=False)
+        self.bed_temp_reference = config.getfloat('bed_temp_reference', None)
         self.hotend_temp_reference = config.getfloat(
-            'hotend_temp_reference', None, note_valid=False)
+            'hotend_temp_reference', None)
         self.chamber_temp_reference = config.getfloat(
-            'chamber_temp_reference', None, note_valid=False)
+            'chamber_temp_reference', None)
         self.first_layer_reference = config.getfloat(
-            'first_layer_reference', 0.20, note_valid=False)
+            'first_layer_reference', 0.20)
 
-        self.default_profile = _normalize_token(
-            config.get('default_profile', '', note_valid=False))
-        self.chamber_sensor = _normalize_token(
-            config.get('chamber_sensor', '', note_valid=False))
+        self.default_profile = _normalize_token(config.get('default_profile', ''))
+        self.chamber_sensor = _normalize_token(config.get('chamber_sensor', ''))
         self.max_total_adjustment = config.getfloat(
             'max_total_adjustment', 0.600, minval=0.)
         self.apply_move = config.getboolean('apply_move', False)
@@ -200,7 +191,7 @@ class AutoZTap:
 
         # Reference probing position
         configured_ref_xy = config.getfloatlist(
-            'reference_xy_position', None, count=2, note_valid=False)
+            'reference_xy_position', None, count=2)
         if configured_ref_xy is not None:
             self.reference_xy = tuple(configured_ref_xy)
         else:
