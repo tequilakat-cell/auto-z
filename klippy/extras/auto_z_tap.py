@@ -7,6 +7,7 @@
 
 import logging
 import math
+import time
 import collections
 from . import manual_probe
 from . import probe as probe_module
@@ -274,10 +275,13 @@ class ProbeHealthTracker:
 
     MAX_HISTORY = 50
 
-    def __init__(self, printer, gcode, variable_prefix):
+    def __init__(self, printer, gcode, variable_prefix,
+                 spread_limit=0.015, save_fn=None):
         self.printer = printer
         self.gcode = gcode
         self.variable_prefix = variable_prefix
+        self.spread_limit = spread_limit
+        self._save_fn = save_fn
         self.history = []
 
     def load(self):
@@ -334,7 +338,7 @@ class ProbeHealthTracker:
         if stats is None:
             return 'unknown', 0.0
         score = 1.0
-        if stats['avg_spread'] > 0.015:
+        if stats['avg_spread'] > self.spread_limit:
             score -= 0.2
         if stats['retry_rate'] > 0.3:
             score -= 0.2
@@ -396,10 +400,17 @@ class ProbeHealthTracker:
         return 'stable'
 
     def _save(self):
+        key = '%s_probe_history' % (self.variable_prefix,)
+        if self._save_fn is not None:
+            try:
+                self._save_fn(key, self.history)
+            except Exception:
+                pass
+            return
+        # Fallback: direct save (less robust encoding)
         save_obj = self.printer.lookup_object('save_variables', None)
         if save_obj is None:
             return
-        key = '%s_probe_history' % (self.variable_prefix,)
         try:
             self.gcode.run_script_from_command(
                 'SAVE_VARIABLE VARIABLE=%s VALUE="%s"'
@@ -498,61 +509,21 @@ class AdjustmentProfile:
         if first_layer_ref is None:
             first_layer_ref = global_refs.get('first_layer_reference')
 
-        # Bed temperature compensation
-        if bed_temp is not None and bed_ref is not None:
-            if self.bed_temp_poly:
-                val = _compute_poly(self.bed_temp_poly, bed_temp, bed_ref)
+        # Temperature compensation (bed, hotend, chamber)
+        for temp, ref, poly, coeff, label in (
+                (bed_temp, bed_ref,
+                 self.bed_temp_poly, self.bed_temp_coeff, 'bed_temp'),
+                (hotend_temp, hotend_ref,
+                 self.hotend_temp_poly, self.hotend_temp_coeff,
+                 'hotend_temp'),
+                (chamber_temp, chamber_ref,
+                 self.chamber_temp_poly, self.chamber_temp_coeff,
+                 'chamber_temp')):
+            val, detail = _compute_temp_comp(
+                temp, ref, poly, coeff, label)
+            if detail is not None:
                 total += val
-                details.append((
-                    "bed_temp_poly", val,
-                    "poly(%s) T=%.2f ref=%.2f" % (
-                        ','.join('%.8f' % c for c in self.bed_temp_poly),
-                        bed_temp, bed_ref)))
-            elif self.bed_temp_coeff:
-                val = (bed_temp - bed_ref) * self.bed_temp_coeff
-                total += val
-                details.append((
-                    "bed_temp", val,
-                    "(bed %.2f - ref %.2f) * %.6f" % (
-                        bed_temp, bed_ref, self.bed_temp_coeff)))
-
-        # Hotend temperature compensation
-        if hotend_temp is not None and hotend_ref is not None:
-            if self.hotend_temp_poly:
-                val = _compute_poly(
-                    self.hotend_temp_poly, hotend_temp, hotend_ref)
-                total += val
-                details.append((
-                    "hotend_temp_poly", val,
-                    "poly(%s) T=%.2f ref=%.2f" % (
-                        ','.join('%.8f' % c for c in self.hotend_temp_poly),
-                        hotend_temp, hotend_ref)))
-            elif self.hotend_temp_coeff:
-                val = (hotend_temp - hotend_ref) * self.hotend_temp_coeff
-                total += val
-                details.append((
-                    "hotend_temp", val,
-                    "(hotend %.2f - ref %.2f) * %.6f" % (
-                        hotend_temp, hotend_ref, self.hotend_temp_coeff)))
-
-        # Chamber temperature compensation
-        if chamber_temp is not None and chamber_ref is not None:
-            if self.chamber_temp_poly:
-                val = _compute_poly(
-                    self.chamber_temp_poly, chamber_temp, chamber_ref)
-                total += val
-                details.append((
-                    "chamber_temp_poly", val,
-                    "poly(%s) T=%.2f ref=%.2f" % (
-                        ','.join('%.8f' % c for c in self.chamber_temp_poly),
-                        chamber_temp, chamber_ref)))
-            elif self.chamber_temp_coeff:
-                val = (chamber_temp - chamber_ref) * self.chamber_temp_coeff
-                total += val
-                details.append((
-                    "chamber_temp", val,
-                    "(chamber %.2f - ref %.2f) * %.6f" % (
-                        chamber_temp, chamber_ref, self.chamber_temp_coeff)))
+                details.append(detail)
 
         # First layer height compensation
         if (self.first_layer_coeff and first_layer_height is not None
@@ -576,6 +547,31 @@ def _compute_poly(coeffs, temp, ref):
     for i, c in enumerate(coeffs):
         total += c * (delta ** (i + 1))
     return total
+
+
+def _compute_temp_comp(temp, ref, poly_coeffs, linear_coeff, label):
+    """Compute temperature compensation using polynomial or linear model.
+
+    Returns (value, detail_tuple_or_None).  Centralizes the poly-vs-linear
+    pattern used by both global compensation and adjustment profiles.
+    """
+    if temp is None or ref is None:
+        return 0., None
+    if poly_coeffs:
+        val = _compute_poly(poly_coeffs, temp, ref)
+        detail = (
+            "%s_poly" % label, val,
+            "poly(%s) T=%.2f ref=%.2f"
+            % (','.join('%.8f' % c for c in poly_coeffs), temp, ref))
+        return val, detail
+    if linear_coeff:
+        val = (temp - ref) * linear_coeff
+        detail = (
+            label, val,
+            "(%s %.2f - ref %.2f) * %.6f"
+            % (label, temp, ref, linear_coeff))
+        return val, detail
+    return 0., None
 
 
 # ---------------------------------------------------------------------------
@@ -762,6 +758,7 @@ class AutoZTap:
             'last_drift': None,
             'last_profiles': [],
             'calibration_in_progress': False,
+            'calibration_timestamp': None,
         }
 
         self.printer.register_event_handler(
@@ -800,6 +797,21 @@ class AutoZTap:
     def _var_key(self, suffix):
         return '%s_%s' % (self.variable_prefix, suffix)
 
+    def _format_calibration_age(self):
+        ts = self.status.get('calibration_timestamp')
+        if ts is None:
+            return 'unknown'
+        try:
+            hours = (time.time() - float(ts)) / 3600.
+            if hours < 1.:
+                return '%.0f minutes ago' % (hours * 60.,)
+            elif hours < 48.:
+                return '%.1f hours ago' % (hours,)
+            else:
+                return '%.1f days ago' % (hours / 24.,)
+        except (ValueError, TypeError):
+            return 'unknown'
+
     def _derive_reference_xy(self, config):
         if (not config.has_section('stepper_x')
                 or not config.has_section('stepper_y')):
@@ -823,7 +835,9 @@ class AutoZTap:
             self.printer, self.reactor, self.gcode)
         if self.probe_health_tracking:
             self.health_tracker = ProbeHealthTracker(
-                self.printer, self.gcode, self.variable_prefix)
+                self.printer, self.gcode, self.variable_prefix,
+                spread_limit=self.max_probe_spread,
+                save_fn=self._save_variable)
             self.health_tracker.load()
         self._load_persistent_state()
 
@@ -881,6 +895,8 @@ class AutoZTap:
             self._var_key('cal_chamber_temp'), None)
         self.status['calibration_probe_type'] = values.get(
             self._var_key('cal_probe_type'), None)
+        self.status['calibration_timestamp'] = values.get(
+            self._var_key('cal_timestamp'), None)
         self.status['last_probe_z'] = values.get(
             self._var_key('last_probe_z'), None)
         self.status['last_probe_spread'] = values.get(
@@ -1186,16 +1202,20 @@ class AutoZTap:
     # ------------------------------------------------------------------
 
     def _heater_temperature(self, object_name):
+        """Read actual (not target) temperature from a heater or sensor.
+
+        Temperature compensation must use the physical temperature that
+        is affecting the probe trigger point right now, not the setpoint
+        the heater is trying to reach.  Users who want target-based
+        compensation can pass explicit BED_TEMP= / HOTEND_TEMP= params.
+        """
         if not object_name:
             return None
         obj = self.printer.lookup_object(object_name, None)
         if obj is None:
             return None
         status = obj.get_status(self._eventtime())
-        target = status.get('target', 0.)
         temperature = status.get('temperature')
-        if target is not None and target > 0.:
-            return float(target)
         if temperature is not None:
             return float(temperature)
         return None
@@ -1302,75 +1322,29 @@ class AutoZTap:
 
         refs = self._calibration_refs()
 
-        # Global bed temp compensation
-        if env['bed_temp'] is not None:
-            bed_ref = self.bed_temp_reference
-            if bed_ref is None:
-                bed_ref = refs.get('bed_temp_reference')
-            if bed_ref is not None:
-                if self.bed_temp_poly:
-                    val = _compute_poly(
-                        self.bed_temp_poly, env['bed_temp'], bed_ref)
-                    total += val
-                    details.append((
-                        "global_bed_temp_poly", val,
-                        "poly T=%.2f ref=%.2f" % (env['bed_temp'], bed_ref)))
-                elif self.bed_temp_coeff:
-                    val = (env['bed_temp'] - bed_ref) * self.bed_temp_coeff
-                    total += val
-                    details.append((
-                        "global_bed_temp", val,
-                        "(bed %.2f - ref %.2f) * %.6f"
-                        % (env['bed_temp'], bed_ref, self.bed_temp_coeff)))
-
-        # Global hotend temp compensation
-        if env['hotend_temp'] is not None:
-            hotend_ref = self.hotend_temp_reference
-            if hotend_ref is None:
-                hotend_ref = refs.get('hotend_temp_reference')
-            if hotend_ref is not None:
-                if self.hotend_temp_poly:
-                    val = _compute_poly(
-                        self.hotend_temp_poly, env['hotend_temp'], hotend_ref)
-                    total += val
-                    details.append((
-                        "global_hotend_temp_poly", val,
-                        "poly T=%.2f ref=%.2f"
-                        % (env['hotend_temp'], hotend_ref)))
-                elif self.hotend_temp_coeff:
-                    val = ((env['hotend_temp'] - hotend_ref)
-                           * self.hotend_temp_coeff)
-                    total += val
-                    details.append((
-                        "global_hotend_temp", val,
-                        "(hotend %.2f - ref %.2f) * %.6f"
-                        % (env['hotend_temp'], hotend_ref,
-                           self.hotend_temp_coeff)))
-
-        # Global chamber temp compensation
-        if env['chamber_temp'] is not None:
-            chamber_ref = self.chamber_temp_reference
-            if chamber_ref is None:
-                chamber_ref = refs.get('chamber_temp_reference')
-            if chamber_ref is not None:
-                if self.chamber_temp_poly:
-                    val = _compute_poly(
-                        self.chamber_temp_poly,
-                        env['chamber_temp'], chamber_ref)
-                    total += val
-                    details.append((
-                        "global_chamber_temp_poly", val,
-                        "poly T=%.2f ref=%.2f"
-                        % (env['chamber_temp'], chamber_ref)))
-                elif self.chamber_temp_coeff:
-                    val = ((env['chamber_temp'] - chamber_ref)
-                           * self.chamber_temp_coeff)
-                    total += val
-                    details.append((
-                        "global_chamber_temp", val,
-                        "(chamber %.2f - ref %.2f) * %.6f"
-                        % (env['chamber_temp'], chamber_ref,
-                           self.chamber_temp_coeff)))
+        # Global temperature compensation (bed, hotend, chamber)
+        for env_key, ref_attr, ref_key, poly, coeff, label in (
+                ('bed_temp', 'bed_temp_reference',
+                 'bed_temp_reference',
+                 self.bed_temp_poly, self.bed_temp_coeff,
+                 'global_bed_temp'),
+                ('hotend_temp', 'hotend_temp_reference',
+                 'hotend_temp_reference',
+                 self.hotend_temp_poly, self.hotend_temp_coeff,
+                 'global_hotend_temp'),
+                ('chamber_temp', 'chamber_temp_reference',
+                 'chamber_temp_reference',
+                 self.chamber_temp_poly, self.chamber_temp_coeff,
+                 'global_chamber_temp')):
+            temp = env.get(env_key)
+            ref = getattr(self, ref_attr, None)
+            if ref is None:
+                ref = refs.get(ref_key)
+            val, detail = _compute_temp_comp(
+                temp, ref, poly, coeff, label)
+            if detail is not None:
+                total += val
+                details.append(detail)
 
         # Global first layer compensation
         if (self.first_layer_coeff
@@ -1425,21 +1399,55 @@ class AutoZTap:
         min_safe = gcmd.get_float('SAFE_OFFSET_MIN', self.safe_offset_min)
         max_safe = gcmd.get_float('SAFE_OFFSET_MAX', self.safe_offset_max)
 
-        if final_offset < min_safe:
-            raise gcmd.error(
-                "AUTO_Z_TAP SAFETY: Offset %.4fmm is below safe minimum "
-                "%.4fmm.\n"
-                "This could cause nozzle collision with the bed.\n"
-                "Check probe calibration or adjust safe_offset_min in "
-                "[auto_z_tap]." % (final_offset, min_safe))
-
-        if final_offset > max_safe:
-            raise gcmd.error(
-                "AUTO_Z_TAP SAFETY: Offset %.4fmm exceeds safe maximum "
-                "%.4fmm.\n"
-                "This could cause poor adhesion or air printing.\n"
-                "Check probe calibration or adjust safe_offset_max in "
-                "[auto_z_tap]." % (final_offset, max_safe))
+        # When calibrated, check deviation from the calibrated offset rather
+        # than the absolute value.  Probes with a physical offset from the
+        # nozzle (microprobe, BLTouch) produce legitimately large absolute
+        # offsets; only unexpected *changes* from calibration are dangerous.
+        if self.status['calibrated']:
+            calibrated_offset = (self.status['reference_probe_z']
+                                 + self.status['paper_delta'])
+            deviation = final_offset - calibrated_offset
+            if deviation < min_safe:
+                raise gcmd.error(
+                    "AUTO_Z_TAP SAFETY: Offset %.4fmm deviates %.4fmm "
+                    "below calibrated offset %.4fmm (limit %.4fmm).\n"
+                    "This could cause nozzle collision with the bed.\n"
+                    "Possible causes:\n"
+                    "  - Temperature changed significantly since "
+                    "calibration\n"
+                    "  - Adjustment profiles pushing offset too far\n"
+                    "Try: Re-calibrate or adjust safe_offset_min in "
+                    "[auto_z_tap]."
+                    % (final_offset, deviation,
+                       calibrated_offset, min_safe))
+            if deviation > max_safe:
+                raise gcmd.error(
+                    "AUTO_Z_TAP SAFETY: Offset %.4fmm deviates %.4fmm "
+                    "above calibrated offset %.4fmm (limit %.4fmm).\n"
+                    "This could cause poor adhesion or air printing.\n"
+                    "Possible causes:\n"
+                    "  - Temperature changed significantly since "
+                    "calibration\n"
+                    "  - Adjustment profiles pushing offset too far\n"
+                    "Try: Re-calibrate or adjust safe_offset_max in "
+                    "[auto_z_tap]."
+                    % (final_offset, deviation,
+                       calibrated_offset, max_safe))
+        else:
+            if final_offset < min_safe:
+                raise gcmd.error(
+                    "AUTO_Z_TAP SAFETY: Offset %.4fmm is below safe "
+                    "minimum %.4fmm.\n"
+                    "This could cause nozzle collision with the bed.\n"
+                    "Check probe calibration or adjust safe_offset_min "
+                    "in [auto_z_tap]." % (final_offset, min_safe))
+            if final_offset > max_safe:
+                raise gcmd.error(
+                    "AUTO_Z_TAP SAFETY: Offset %.4fmm exceeds safe "
+                    "maximum %.4fmm.\n"
+                    "This could cause poor adhesion or air printing.\n"
+                    "Check probe calibration or adjust safe_offset_max "
+                    "in [auto_z_tap]." % (final_offset, max_safe))
 
     # ------------------------------------------------------------------
     # Offset application
@@ -1460,8 +1468,9 @@ class AutoZTap:
     # ------------------------------------------------------------------
 
     def _summarize(self, result):
+        mode = "DRY_RUN" if result.get('dry_run') else "applied"
         lines = [
-            "AUTO_Z_TAP applied (probe_type=%s):" % (self.probe_type,),
+            "AUTO_Z_TAP %s (probe_type=%s):" % (mode, self.probe_type),
             "  reference_xy=%.3f,%.3f" % (
                 result['reference_x'], result['reference_y']),
             "  probe_z=%.6f spread=%.4f drift=%.4f" % (
@@ -1524,7 +1533,8 @@ class AutoZTap:
         for src, key in (
                 ('calibration_bed_temp', 'cal_bed_temp'),
                 ('calibration_hotend_temp', 'cal_hotend_temp'),
-                ('calibration_chamber_temp', 'cal_chamber_temp')):
+                ('calibration_chamber_temp', 'cal_chamber_temp'),
+                ('calibration_timestamp', 'cal_timestamp')):
             val = self.status.get(src)
             if val is not None:
                 self._save_variable(self._var_key(key), float(val))
@@ -1623,7 +1633,13 @@ class AutoZTap:
         else:
             self._validate_offset_safety(gcmd, final_offset)
 
-        self._apply_offset(gcmd, final_offset)
+        dry_run = gcmd.get_int('DRY_RUN', 0, minval=0, maxval=1)
+        if dry_run:
+            self.gcode.respond_info(
+                "AUTO_Z_TAP DRY_RUN: Would apply Z=%.6f "
+                "(not applied)" % (final_offset,))
+        else:
+            self._apply_offset(gcmd, final_offset)
 
         # Update status
         self.status['last_probe_z'] = float(probe_z)
@@ -1632,23 +1648,25 @@ class AutoZTap:
         self.status['last_drift'] = float(drift)
         self.status['last_profiles'] = [p.name for p in profiles]
 
-        # Persist
-        save = gcmd.get_int(
-            'SAVE', 1 if self.persist_last_run else 0,
-            minval=0, maxval=1)
-        if save:
-            self._persist_last_run()
+        if not dry_run:
+            # Persist
+            save = gcmd.get_int(
+                'SAVE', 1 if self.persist_last_run else 0,
+                minval=0, maxval=1)
+            if save:
+                self._persist_last_run()
 
-        # Health tracking
-        if self.health_tracker:
-            self.health_tracker.record_session(
-                probe_z, probe_spread, drift, samples,
-                retries_used or 0,
-                bed_temp=env.get('bed_temp'),
-                hotend_temp=env.get('hotend_temp'))
-            warnings = self.health_tracker.check_health()
-            for w in warnings:
-                self.gcode.respond_info("AUTO_Z_TAP WARNING: %s" % (w,))
+            # Health tracking
+            if self.health_tracker:
+                self.health_tracker.record_session(
+                    probe_z, probe_spread, drift, samples,
+                    retries_used or 0,
+                    bed_temp=env.get('bed_temp'),
+                    hotend_temp=env.get('hotend_temp'))
+                warnings = self.health_tracker.check_health()
+                for w in warnings:
+                    self.gcode.respond_info(
+                        "AUTO_Z_TAP WARNING: %s" % (w,))
 
         result = {
             'reference_x': x,
@@ -1666,6 +1684,7 @@ class AutoZTap:
             'details': details,
             'warmup_taps': self.warmup_taps if did_warmup else 0,
             'thermal_soak': did_soak,
+            'dry_run': bool(dry_run),
         }
         return result
 
@@ -1788,6 +1807,7 @@ class AutoZTap:
             self.status['calibration_chamber_temp'] = (
                 pending['calibration_chamber_temp'])
             self.status['calibration_probe_type'] = self.probe_type
+            self.status['calibration_timestamp'] = time.time()
 
             self._persist_calibration()
 
@@ -1914,6 +1934,7 @@ class AutoZTap:
                 self.status['calibration_chamber_temp']),
             "  calibration_probe_type=%s" % (
                 self.status.get('calibration_probe_type', 'unknown'),),
+            "  calibration_age=%s" % (self._format_calibration_age(),),
             "  last_probe_z=%s spread=%s drift=%s" % (
                 self.status['last_probe_z'],
                 self.status['last_probe_spread'],
@@ -1950,18 +1971,26 @@ class AutoZTap:
         self.status['calibrated'] = False
         self.status['reference_probe_z'] = 0.0
         self.status['paper_delta'] = 0.0
+        self.status['calibration_bed_temp'] = None
+        self.status['calibration_hotend_temp'] = None
+        self.status['calibration_chamber_temp'] = None
+        self.status['calibration_probe_type'] = None
         self.status['last_probe_z'] = None
         self.status['last_probe_spread'] = None
         self.status['last_offset'] = None
         self.status['last_drift'] = None
+        self.status['last_profiles'] = []
 
+        # Clear all persisted variables
+        for suffix in ('calibrated', 'reference_probe_z', 'paper_delta',
+                        'reference_x', 'reference_y',
+                        'cal_bed_temp', 'cal_hotend_temp',
+                        'cal_chamber_temp', 'cal_probe_type',
+                        'last_probe_z', 'last_probe_spread',
+                        'last_offset', 'last_drift'):
+            self._save_variable(self._var_key(suffix), 0.0)
+        # Reset the calibration flag explicitly as boolean
         self._save_variable(self._var_key('calibrated'), False)
-        self._save_variable(self._var_key('reference_probe_z'), 0.0)
-        self._save_variable(self._var_key('paper_delta'), 0.0)
-        self._save_variable(self._var_key('last_probe_z'), 0.0)
-        self._save_variable(self._var_key('last_probe_spread'), 0.0)
-        self._save_variable(self._var_key('last_offset'), 0.0)
-        self._save_variable(self._var_key('last_drift'), 0.0)
 
         clear_history = gcmd.get_int(
             'CLEAR_HISTORY', 0, minval=0, maxval=1)
@@ -2096,6 +2125,24 @@ class AutoZTap:
         status['warmup_taps'] = self.warmup_taps
         status['safe_offset_min'] = self.safe_offset_min
         status['safe_offset_max'] = self.safe_offset_max
+        status['probe_samples'] = self.probe_samples
+        status['max_probe_spread'] = self.max_probe_spread
+        status['max_drift'] = self.max_drift
+        status['global_offset'] = self.global_offset
+        status['max_total_adjustment'] = self.max_total_adjustment
+        status['adaptive_samples'] = self.adaptive_samples
+        status['available_profiles'] = sorted(self.adjustments.keys())
+
+        # Calibration age
+        ts = status.get('calibration_timestamp')
+        if ts is not None:
+            try:
+                status['calibration_age_hours'] = round(
+                    (time.time() - float(ts)) / 3600., 1)
+            except (ValueError, TypeError):
+                status['calibration_age_hours'] = None
+        else:
+            status['calibration_age_hours'] = None
 
         if self.health_tracker:
             stats = self.health_tracker.get_statistics()

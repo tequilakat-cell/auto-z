@@ -12,7 +12,7 @@ Automatic Z-offset plugin for Klipper that interactively calibrates your Z offse
 - **Probe health monitoring** -- tracks spread, drift, and retry rates across runs.  Detects degradation trends and warns you before problems affect prints.
 - **Adaptive sample count** -- optionally lets the health tracker reduce samples when confidence is high or increase them when readings are erratic.
 - **Adjustment profiles** -- per-material, per-surface, per-nozzle, and per-probe-type offset profiles with temperature coefficients.
-- **Safety guards** -- rejects computed offsets outside a safe range to prevent nozzle crashes or air printing.
+- **Safety guards** -- deviation-based safety check compares the computed offset against the calibrated offset.  Catches drift and adjustment errors without false positives on probes with large physical offsets (microprobe, BLTouch).
 - **Polynomial temperature compensation** -- for probes with non-linear temperature response (inductive/capacitive).
 - **Moonraker integration** -- update manager support and `get_status()` for Mainsail/Fluidd.
 
@@ -271,6 +271,7 @@ Main command.  Call in `START_PRINT` for automatic Z offset.
 - `SAFE_OFFSET_MIN=<float>` / `SAFE_OFFSET_MAX=<float>` -- offset range
 - `MOVE=1|0` / `MOVE_SPEED=<float>` -- SET_GCODE_OFFSET move behavior
 - `SAVE=1|0` -- persist last run values
+- `DRY_RUN=1` -- compute and report offset without applying it (useful for testing config changes)
 - `X=<float>` / `Y=<float>` -- override reference position
 
 ### AUTO_Z_TAP_CALIBRATE
