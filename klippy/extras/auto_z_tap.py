@@ -1569,6 +1569,12 @@ class AutoZTap:
         x, y = self._resolve_reference_xy(gcmd)
 
         if probe_result is None:
+            # Clear any existing Z gcode offset so that the probe
+            # starts from a clean state.  Without this, a stale offset
+            # from a previous run can shift the toolhead starting
+            # position and produce wildly incorrect results.
+            self.gcode.run_script_from_command('SET_GCODE_OFFSET Z=0')
+
             # Thermal soak
             self._maybe_thermal_soak(gcmd)
             did_soak = self.thermal_soak_enabled
@@ -1702,6 +1708,9 @@ class AutoZTap:
 
             stage = "manual-probe-check"
             manual_probe.verify_no_manual_probe(self.printer)
+
+            # Clear stale gcode Z offset for a clean starting point
+            self.gcode.run_script_from_command('SET_GCODE_OFFSET Z=0')
 
             # Thermal soak before calibration
             stage = "thermal-soak"
