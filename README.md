@@ -98,7 +98,7 @@ The calibration is stored in `[save_variables]` and persists across restarts.  Y
 
 ## Per-Print Usage
 
-Add one line to your `START_PRINT` macro:
+Add `AUTO_Z_TAP` to your `START_PRINT` macro **after heating bed and hotend**:
 
 ```gcode
 AUTO_Z_TAP MATERIAL={params.MATERIAL|default("pla")|lower} BUILD_SURFACE={params.SURFACE|default("pei")|lower} BED_TEMP={params.BED|float} HOTEND_TEMP={params.HOTEND|float} FIRST_LAYER_HEIGHT={params.FIRST_LAYER_HEIGHT|default(0.2)|float}
@@ -111,6 +111,43 @@ AUTO_Z_TAP
 ```
 
 The plugin handles everything automatically: thermal soak, warm-up taps, multi-sample probing, drift detection, temperature compensation, profile matching, safety validation, and offset application.
+
+### START_PRINT Macro Example
+
+**Critical:** Heat both bed and hotend **before** calling `AUTO_Z_TAP`.  CNC Tap is especially sensitive to hotend temperature -- the nozzle and heater block expand as they heat, shifting the probe trigger point.  If you calibrate or probe cold and then heat to printing temperatures, the offset will be wrong.
+
+```gcode
+[gcode_macro START_PRINT]
+gcode:
+    {% set BED_TEMP = params.BED_TEMP|default(60)|float %}
+    {% set EXTRUDER_TEMP = params.EXTRUDER_TEMP|default(200)|float %}
+
+    # Start heating both heaters simultaneously
+    M140 S{BED_TEMP}
+    M104 S{EXTRUDER_TEMP}
+
+    # Home while heaters warm up
+    G28
+
+    # Wait for both heaters to reach target
+    M190 S{BED_TEMP}
+    M109 S{EXTRUDER_TEMP}
+
+    # Probe and mesh at printing temperatures
+    BED_MESH_CALIBRATE
+    AUTO_Z_TAP
+
+    # Prime nozzle
+    G1 Z5 F3000
+    # ... your purge line ...
+```
+
+**Common mistakes:**
+- `G92 Z20` before homing -- this resets the Z coordinate system and can corrupt probe readings.  **Never** use `G92 Z` unless you know exactly what it does.
+- Heating hotend **after** `AUTO_Z_TAP` -- CNC Tap probes with the nozzle; thermal expansion of a cold-to-hot hotend changes the trigger point by 50-200 microns.
+- Running `AUTO_Z_TAP CALIBRATE=1` with a cold printer -- calibration should be done at or near your typical printing temperatures.
+
+The plugin will warn you if it detects cold temperatures or large temperature deviations from calibration.
 
 ## Configuration Reference
 
@@ -356,6 +393,20 @@ Re-run `AUTO_Z_TAP_CALIBRATE` at your typical printing temperatures.
 ### "offset below safe minimum" / "exceeds safe maximum"
 
 The computed Z offset is outside the expected range.  This is a safety check to prevent nozzle crashes.  Check calibration accuracy, or adjust `safe_offset_min` / `safe_offset_max`.
+
+### Nozzle too close or too far after calibration
+
+If calibration completes successfully but first layers are wrong (nozzle digging in or printing in air), the most common cause is **temperature mismatch**:
+
+1. **Calibrated cold, printing hot** -- re-run `AUTO_Z_TAP CALIBRATE=1` with both bed and hotend at your typical printing temperatures.
+2. **Hotend heated after AUTO_Z_TAP** -- in your `START_PRINT`, make sure `M109` (wait for hotend) comes **before** `AUTO_Z_TAP`, not after.
+3. **`G92 Z` in your macro** -- remove any `G92 Zxx` commands before `AUTO_Z_TAP`.  These corrupt the coordinate system.
+
+Run `AUTO_Z_TAP_STATUS` to check your calibration temperatures.  If they show a cold hotend (< 50°C) but you print at 200°C+, that's the problem.
+
+### "Temperature differs significantly from calibration"
+
+The plugin detected that your current bed or hotend temperature is far from the temperature recorded during calibration.  While temperature compensation will try to correct for this, large deltas (> 40°C) reduce accuracy.  For best results, calibrate at temperatures close to your printing conditions.
 
 ### Probe health warnings
 

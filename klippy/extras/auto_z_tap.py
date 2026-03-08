@@ -1197,6 +1197,90 @@ class AutoZTap:
                 "AUTO_Z_TAP: Thermal soak timed out after %.0fs. "
                 "Proceeding with current temperatures." % (timeout,))
 
+    # Cold temperature thresholds (below these, warn the user)
+    _COLD_BED_THRESHOLD = 35.0    # °C
+    _COLD_HOTEND_THRESHOLD = 50.0  # °C
+    # Per-print temperature deviation threshold (warn if current temp
+    # differs from calibration temp by more than this)
+    _TEMP_DEVIATION_WARN = 40.0    # °C
+
+    def _warn_cold_temperatures(self, gcmd, context='probing'):
+        """Warn if heater temperatures look too cold for accurate probing.
+
+        CNC Tap and inductive probes are thermally sensitive — calibrating
+        or probing with a cold printer produces reference values that won't
+        match printing conditions, leading to bad Z offsets.
+        """
+        warnings = []
+        bed_temp = self._heater_temperature('heater_bed')
+        hotend_temp = self._heater_temperature(
+            self._resolve_hotend_object_name())
+
+        if self.probe_type in ('tap', 'inductive'):
+            if bed_temp is not None and bed_temp < self._COLD_BED_THRESHOLD:
+                warnings.append(
+                    "Bed temperature is %.1f°C (< %.0f°C)."
+                    % (bed_temp, self._COLD_BED_THRESHOLD))
+            if (hotend_temp is not None
+                    and hotend_temp < self._COLD_HOTEND_THRESHOLD):
+                warnings.append(
+                    "Hotend temperature is %.1f°C (< %.0f°C)."
+                    % (hotend_temp, self._COLD_HOTEND_THRESHOLD))
+        elif self.probe_type in ('bltouch', 'microprobe'):
+            # These are less thermally sensitive, but a cold bed still
+            # means the frame hasn't settled and the result may drift.
+            if bed_temp is not None and bed_temp < self._COLD_BED_THRESHOLD:
+                warnings.append(
+                    "Bed temperature is %.1f°C (< %.0f°C)."
+                    % (bed_temp, self._COLD_BED_THRESHOLD))
+
+        if warnings:
+            msg = (
+                "AUTO_Z_TAP WARNING: %s with cold temperatures!\n  "
+                % (context.capitalize(),)
+                + "\n  ".join(warnings)
+                + "\nFor accurate results, heat bed and hotend to printing "
+                "temperatures before %s.\n"
+                "In START_PRINT, move M190/M109 BEFORE AUTO_Z_TAP."
+                % (context,))
+            self.gcode.respond_info(msg)
+
+    def _warn_calibration_temp_mismatch(self, gcmd):
+        """Warn if current temperatures differ significantly from calibration.
+
+        Large temperature differences between calibration and current run
+        mean the thermal compensation has to correct a big delta, which
+        reduces accuracy (especially if coefficients aren't perfectly tuned).
+        """
+        if not self.status['calibrated']:
+            return
+        warnings = []
+        cal_bed = self.status.get('calibration_bed_temp')
+        cal_hotend = self.status.get('calibration_hotend_temp')
+        bed_temp = self._heater_temperature('heater_bed')
+        hotend_temp = self._heater_temperature(
+            self._resolve_hotend_object_name())
+
+        if (cal_bed is not None and bed_temp is not None
+                and abs(bed_temp - cal_bed) > self._TEMP_DEVIATION_WARN):
+            warnings.append(
+                "Bed: now %.1f°C vs calibrated %.1f°C (Δ%.1f°C)"
+                % (bed_temp, cal_bed, bed_temp - cal_bed))
+        if (cal_hotend is not None and hotend_temp is not None
+                and abs(hotend_temp - cal_hotend) > self._TEMP_DEVIATION_WARN):
+            warnings.append(
+                "Hotend: now %.1f°C vs calibrated %.1f°C (Δ%.1f°C)"
+                % (hotend_temp, cal_hotend, hotend_temp - cal_hotend))
+
+        if warnings:
+            self.gcode.respond_info(
+                "AUTO_Z_TAP WARNING: Temperature differs significantly "
+                "from calibration:\n  "
+                + "\n  ".join(warnings)
+                + "\nTemperature compensation will try to correct this, "
+                "but for best accuracy, calibrate at or near printing "
+                "temperatures.\nTo re-calibrate: AUTO_Z_TAP CALIBRATE=1")
+
     # ------------------------------------------------------------------
     # Temperature reading
     # ------------------------------------------------------------------
@@ -1469,6 +1553,8 @@ class AutoZTap:
 
     def _summarize(self, result):
         mode = "DRY_RUN" if result.get('dry_run') else "applied"
+        if result.get('is_calibration'):
+            mode = "calibration"
         lines = [
             "AUTO_Z_TAP %s (probe_type=%s):" % (mode, self.probe_type),
             "  reference_xy=%.3f,%.3f" % (
@@ -1477,9 +1563,23 @@ class AutoZTap:
                 result['probe_z'], result['probe_spread'], result['drift']),
             "  paper_delta=%.6f estimated_paper_z=%.6f" % (
                 result['paper_delta'], result['estimated_paper_z']),
-            "  adjustment_total=%.4f final_offset=%.6f" % (
-                result['adjustment_total'], result['final_offset']),
         ]
+
+        cal_baseline = result.get('calibration_baseline')
+        if result.get('is_calibration'):
+            lines.append(
+                "  final_offset=%.6f (= paper test position, no adjustments)"
+                % (result['final_offset'],))
+        else:
+            lines.append(
+                "  adjustment_total=%.4f final_offset=%.6f" % (
+                    result['adjustment_total'], result['final_offset']))
+            if cal_baseline is not None:
+                delta = result['final_offset'] - cal_baseline
+                lines.append(
+                    "  vs_calibration=%.6f (delta=%+.6f)"
+                    % (cal_baseline, delta))
+
         if result.get('warmup_taps'):
             lines.append("  warmup_taps=%d" % (result['warmup_taps'],))
         if result.get('thermal_soak'):
@@ -1575,6 +1675,10 @@ class AutoZTap:
             # position and produce wildly incorrect results.
             self.gcode.run_script_from_command('SET_GCODE_OFFSET Z=0')
 
+            # Temperature sanity checks
+            self._warn_cold_temperatures(gcmd, context='probing')
+            self._warn_calibration_temp_mismatch(gcmd)
+
             # Thermal soak
             self._maybe_thermal_soak(gcmd)
             did_soak = self.thermal_soak_enabled
@@ -1619,14 +1723,28 @@ class AutoZTap:
                 % (drift, direction, max_drift, abs(drift), direction))
 
         estimated_paper_z = probe_z + self.status['paper_delta']
+        calibration_baseline = (self.status['reference_probe_z']
+                                + self.status['paper_delta'])
         env = self._resolve_environment(gcmd)
-        adjustment, details, profiles = self._compute_adjustment(gcmd, env)
+
+        if is_calibration:
+            # During calibration the paper test IS the ground truth.
+            # No adjustments (global_offset, temp comp, profiles, EXTRA)
+            # are applied — those are runtime-only deltas so that
+            # the paper test position is always exactly reproduced
+            # when conditions match calibration.
+            adjustment = 0.
+            details = []
+            profiles = []
+        else:
+            adjustment, details, profiles = \
+                self._compute_adjustment(gcmd, env)
+
         final_offset = estimated_paper_z + adjustment
 
-        # Safety check -- skip during calibration because the user just
-        # set this offset interactively via the paper test and it is trusted.
+        # Safety check
         if is_calibration:
-            # Still warn if the offset looks unusual for this probe type
+            # Warn but don't error — user just set this interactively
             min_safe = gcmd.get_float('SAFE_OFFSET_MIN', self.safe_offset_min)
             max_safe = gcmd.get_float('SAFE_OFFSET_MAX', self.safe_offset_max)
             if final_offset < min_safe or final_offset > max_safe:
@@ -1684,6 +1802,7 @@ class AutoZTap:
             'drift': drift,
             'paper_delta': self.status['paper_delta'],
             'estimated_paper_z': estimated_paper_z,
+            'calibration_baseline': calibration_baseline,
             'adjustment_total': adjustment,
             'final_offset': final_offset,
             'profiles': [p.name for p in profiles],
@@ -1691,6 +1810,7 @@ class AutoZTap:
             'warmup_taps': self.warmup_taps if did_warmup else 0,
             'thermal_soak': did_soak,
             'dry_run': bool(dry_run),
+            'is_calibration': is_calibration,
         }
         return result
 
@@ -1711,6 +1831,10 @@ class AutoZTap:
 
             # Clear stale gcode Z offset for a clean starting point
             self.gcode.run_script_from_command('SET_GCODE_OFFSET Z=0')
+
+            # Warn if temperatures are too cold for calibration
+            stage = "temperature-check"
+            self._warn_cold_temperatures(gcmd, context='calibrating')
 
             # Thermal soak before calibration
             stage = "thermal-soak"
@@ -1937,6 +2061,9 @@ class AutoZTap:
             "  reference_probe_z=%.6f" % (
                 self.status['reference_probe_z'],),
             "  paper_delta=%.6f" % (self.status['paper_delta'],),
+            "  calibration_offset=%.6f (paper test position)" % (
+                self.status['reference_probe_z']
+                + self.status['paper_delta'],),
             "  calibration_temps bed=%s hotend=%s chamber=%s" % (
                 self.status['calibration_bed_temp'],
                 self.status['calibration_hotend_temp'],
@@ -1949,6 +2076,13 @@ class AutoZTap:
                 self.status['last_probe_spread'],
                 self.status['last_drift']),
             "  last_offset=%s" % (self.status['last_offset'],),
+            "  last_vs_calibration=%s" % (
+                ("%+.6f" % (
+                    float(self.status['last_offset'])
+                    - (self.status['reference_probe_z']
+                       + self.status['paper_delta'])))
+                if self.status['last_offset'] is not None
+                else 'n/a',),
             "  warmup_taps=%d thermal_soak=%s" % (
                 self.warmup_taps,
                 'enabled' if self.thermal_soak_enabled else 'disabled'),
@@ -2141,6 +2275,8 @@ class AutoZTap:
         status['max_total_adjustment'] = self.max_total_adjustment
         status['adaptive_samples'] = self.adaptive_samples
         status['available_profiles'] = sorted(self.adjustments.keys())
+        status['calibration_offset'] = (
+            status['reference_probe_z'] + status['paper_delta'])
 
         # Calibration age
         ts = status.get('calibration_timestamp')
