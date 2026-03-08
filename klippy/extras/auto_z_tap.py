@@ -1545,7 +1545,8 @@ class AutoZTap:
 
     def _run_auto_apply(self, gcmd, probe_result=None, probe_spread=None,
                         samples=None, retries_used=None,
-                        did_warmup=False, did_soak=False):
+                        did_warmup=False, did_soak=False,
+                        is_calibration=False):
         self._require_probe(gcmd)
         self._require_save_variables(gcmd)
 
@@ -1606,8 +1607,21 @@ class AutoZTap:
         adjustment, details, profiles = self._compute_adjustment(gcmd, env)
         final_offset = estimated_paper_z + adjustment
 
-        # Safety check
-        self._validate_offset_safety(gcmd, final_offset)
+        # Safety check -- skip during calibration because the user just
+        # set this offset interactively via the paper test and it is trusted.
+        if is_calibration:
+            # Still warn if the offset looks unusual for this probe type
+            min_safe = gcmd.get_float('SAFE_OFFSET_MIN', self.safe_offset_min)
+            max_safe = gcmd.get_float('SAFE_OFFSET_MAX', self.safe_offset_max)
+            if final_offset < min_safe or final_offset > max_safe:
+                self.gcode.respond_info(
+                    "AUTO_Z_TAP note: Calibration offset %.4fmm is outside "
+                    "the typical range [%.4f, %.4f] for probe_type=%s.\n"
+                    "This is normal for some setups. If first-layer results "
+                    "are poor, re-run AUTO_Z_TAP_CALIBRATE."
+                    % (final_offset, min_safe, max_safe, self.probe_type))
+        else:
+            self._validate_offset_safety(gcmd, final_offset)
 
         self._apply_offset(gcmd, final_offset)
 
@@ -1785,7 +1799,8 @@ class AutoZTap:
                 probe_result=probe_result,
                 probe_spread=pending['probe_spread'],
                 samples=pending['samples'],
-                retries_used=pending['retries_used'])
+                retries_used=pending['retries_used'],
+                is_calibration=True)
 
             lines = [
                 "AUTO_Z_TAP calibration complete:",
